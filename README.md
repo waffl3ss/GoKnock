@@ -9,6 +9,15 @@ Finally, it also creates a nice clean list for future usage, all conducted from 
 
 If youre having problems with the token, you didnt go through the README, or you didnt use the interactive firefox option.
 
+Compiled releases found in the [RELEASES](https://github.com/waffl3ss/GoKnock/releases) page.
+
+If building from source:
+```
+go mod init GoKnock
+go mod tidy
+go build
+```
+
 ### v0.3 Initial Release
 - Initial release of the go version of KnockKnock.
 
