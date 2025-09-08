@@ -18,6 +18,9 @@ go mod tidy
 go build
 ```
 
+### v0.5 Tenant Lookup Fixes
+- Implemented a new way to find the tenant name. Should be much better at actually getting the tenant name now.
+
 ### v0.3 Initial Release
 - Initial release of the go version of KnockKnock.
 
@@ -93,5 +96,7 @@ Note: There will be a few POST to endpoints with `/oauth2/v2.0/token?` in it. Ma
 
 # References
 
+[TenantIDLookup](https://tenantidlookup.com/)  
 [@nyxgeek](https://github.com/nyxgeek) - [onedrive_user_enum](https://github.com/nyxgeek/onedrive_user_enum)  
 [@immunIT](https://github.com/immunIT) - [TeamsUserEnum](https://github.com/immunIT/TeamsUserEnum)  
+
