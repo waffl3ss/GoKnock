@@ -54,7 +54,7 @@ go build
    Y88b  d88P Y88..88P 888   Y88b  888  888 Y88..88P Y88b.    888 "88b 
     "Y8888P88  "Y88P"  888    Y88b 888  888  "Y88P"   "Y8888P 888  888 
       
-          v0.3                                              @waffl3ss
+          v0.5                                              @waffl3ss
 
   -d string
         Domain to target (required)
