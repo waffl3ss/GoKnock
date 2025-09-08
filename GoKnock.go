@@ -4,8 +4,10 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
@@ -19,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -40,13 +43,17 @@ const (
    Y88b  d88P Y88..88P 888   Y88b  888  888 Y88..88P Y88b.    888 "88b 
     "Y8888P88  "Y88P"  888    Y88b 888  888  "Y88P"   "Y8888P 888  888 
       
-	  v0.3                                              @waffl3ss`
+	  v0.5                                              @waffl3ss`
 
 	MITMPROXY_PORT     = 8000
 	CLIENT_VERSION     = "27/1.0.0.2021011237"
 	URL_TEAMS          = "https://teams.microsoft.com/api/mt/emea/beta/users/"
 	URL_PRESENCE_TEAMS = "https://presence.teams.microsoft.com/v1/presence/getpresence/"
 	TOKEN_FILE         = "token.txt"
+
+	TENANT_LOOKUP_BASE_URL = "https://tenantidlookup.com"
+	TENANT_LOOKUP_AUTH_URL = TENANT_LOOKUP_BASE_URL + "/api/v1/authenticate"
+	TENANT_LOOKUP_API_URL  = TENANT_LOOKUP_BASE_URL + "/api/v1/tenant-id"
 )
 
 type Config struct {
@@ -91,6 +98,25 @@ type TeamsResponse struct {
 
 type TokenResponse struct {
 	AccessToken string `json:"access_token"`
+}
+
+type TenantAuthRequest struct {
+	ClientID string `json:"client_id"`
+}
+
+type TenantAuthResponse struct {
+	Token       string `json:"token"`
+	AccessToken string `json:"accessToken"`
+}
+
+type TenantOpenIDConfig struct {
+	Issuer string `json:"issuer"`
+}
+
+type TenantLookupInfo struct {
+	TenantID          string `json:"tenantId"`
+	DefaultDomainName string `json:"defaultDomainName"`
+	DisplayName       string `json:"displayName"`
 }
 
 type Logger struct {
@@ -661,6 +687,103 @@ func getTokenViaProxy(logger *Logger) (string, error) {
 	}
 }
 
+func generateClientIDForTenantLookup() string {
+	bucket := strconv.FormatInt(time.Now().Unix()/15, 10)
+	hash := sha256.Sum256([]byte(bucket))
+	return fmt.Sprintf("%x", hash)
+}
+
+func getTokenFromTenantLookup() (string, error) {
+	clientID := generateClientIDForTenantLookup()
+	authReq := TenantAuthRequest{ClientID: clientID}
+
+	jsonData, err := json.Marshal(authReq)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal auth request: %w", err)
+	}
+
+	resp, err := http.Post(TENANT_LOOKUP_AUTH_URL, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to authenticate: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("authentication failed with status: %d", resp.StatusCode)
+	}
+
+	var authResp TenantAuthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&authResp); err != nil {
+		return "", fmt.Errorf("failed to decode auth response: %w", err)
+	}
+
+	token := authResp.Token
+	if token == "" {
+		token = authResp.AccessToken
+	}
+
+	if token == "" {
+		return "", fmt.Errorf("could not retrieve bearer token from authenticate response")
+	}
+
+	return token, nil
+}
+
+func getTenantInfoFromAPI(domain, token string) (*TenantLookupInfo, error) {
+	openIDURL := fmt.Sprintf("https://login.microsoftonline.com/%s/.well-known/openid-configuration", domain)
+	resp, err := http.Get(openIDURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get openid configuration: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get openid configuration, status: %d", resp.StatusCode)
+	}
+
+	var config TenantOpenIDConfig
+	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
+		return nil, fmt.Errorf("failed to decode openid configuration: %w", err)
+	}
+
+	parts := strings.Split(config.Issuer, "/")
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("could not extract tenant ID from openid configuration")
+	}
+	tenantID := parts[len(parts)-2]
+
+	if tenantID == "" {
+		return nil, fmt.Errorf("could not extract tenant ID from openid configuration")
+	}
+
+	tenantURL := fmt.Sprintf("%s/%s", TENANT_LOOKUP_API_URL, tenantID)
+	req, err := http.NewRequest("GET", tenantURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create tenant request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+
+	client := &http.Client{}
+	resp, err = client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tenant info: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to get tenant info, status: %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	var tenantInfo TenantLookupInfo
+	if err := json.NewDecoder(resp.Body).Decode(&tenantInfo); err != nil {
+		return nil, fmt.Errorf("failed to decode tenant info: %w", err)
+	}
+
+	return &tenantInfo, nil
+}
+
 func readInputFile(filename string, logger *Logger) ([]string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -699,7 +822,25 @@ func readInputFile(filename string, logger *Logger) ([]string, error) {
 }
 
 func getTenantName(targetDomain string, logger *Logger) (string, error) {
-	logger.Debug("Tenant Discovery Method 1: Sharepoint Discovery...")
+	logger.Debug("Tenant Discovery Method 1: DefaultDomainName via tenantidlookup.com...")
+
+	token, err := getTokenFromTenantLookup()
+	if err == nil {
+		tenantInfo, err := getTenantInfoFromAPI(targetDomain, token)
+		if err == nil && tenantInfo.DefaultDomainName != "" {
+			defaultDomainName := tenantInfo.DefaultDomainName
+			if strings.HasSuffix(defaultDomainName, ".onmicrosoft.com") {
+				tenant := strings.TrimSuffix(defaultDomainName, ".onmicrosoft.com")
+				logger.Debug("SUCCESS: Found tenant name via DefaultDomainName: %s", tenant)
+				return tenant, nil
+			}
+		}
+		logger.Debug("DefaultDomainName method failed: %v", err)
+	} else {
+		logger.Debug("Token retrieval failed: %v", err)
+	}
+
+	logger.Debug("Tenant Discovery Method 2 (Backup): Sharepoint Discovery...")
 
 	domainPart := strings.Split(targetDomain, ".")[0]
 	sharepointURL := fmt.Sprintf("https://%s-my.sharepoint.com", domainPart)
@@ -728,7 +869,7 @@ func getTenantName(targetDomain string, logger *Logger) (string, error) {
 		}
 	}
 
-	logger.Debug("Tenant Discovery Method 2: Pattern Proving (Backup Method)...")
+	logger.Debug("Tenant Discovery Method 3 (Backup): Pattern Proving...")
 
 	domainBase := strings.Split(targetDomain, ".")[0]
 	patterns := []string{
