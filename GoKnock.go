@@ -832,6 +832,7 @@ func getTenantName(targetDomain string, logger *Logger) (string, error) {
 			if strings.HasSuffix(defaultDomainName, ".onmicrosoft.com") {
 				tenant := strings.TrimSuffix(defaultDomainName, ".onmicrosoft.com")
 				logger.Debug("SUCCESS: Found tenant name via DefaultDomainName: %s", tenant)
+				logger.Info("Using Tenant ID: %s", tenant)
 				return tenant, nil
 			}
 		}
@@ -1466,3 +1467,4 @@ func main() {
 		}
 	}
 }
+
