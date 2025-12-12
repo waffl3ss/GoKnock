@@ -1,4 +1,4 @@
-# GoKnock - v0.3 
+# GoKnock - v0.8 
 
 #### Please make sure to actually utilize the README. 
 
