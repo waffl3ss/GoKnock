@@ -4,10 +4,8 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bufio"
-	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
@@ -21,9 +19,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,6 +29,79 @@ import (
 	"github.com/tebeka/selenium"
 	"github.com/tebeka/selenium/firefox"
 )
+
+// Progress bar globals
+var (
+	progressMu      sync.Mutex
+	progressTotal   int64
+	progressCurrent int64
+	progressEnabled bool
+	cancelled       atomic.Bool
+)
+
+func clearLine() {
+	fmt.Print("\r\033[K")
+}
+
+func printProgressBar(current, total int64) {
+	if total <= 0 {
+		return
+	}
+	width := 50
+	progress := float64(current) / float64(total)
+	filled := int(progress * float64(width))
+
+	bar := "["
+	for i := 0; i < width; i++ {
+		if i < filled {
+			bar += "="
+		} else if i == filled && filled < width {
+			bar += ">"
+		} else {
+			bar += " "
+		}
+	}
+	bar += fmt.Sprintf("] %d/%d (%.1f%%)", current, total, progress*100)
+	fmt.Print("\r" + bar)
+}
+
+func printWithProgressBar(message string) {
+	progressMu.Lock()
+	defer progressMu.Unlock()
+
+	// Clear the current progress bar line
+	clearLine()
+
+	// Print the message on its own line
+	fmt.Println(message)
+
+	// Redraw the progress bar if enabled
+	if progressEnabled {
+		current := atomic.LoadInt64(&progressCurrent)
+		total := atomic.LoadInt64(&progressTotal)
+		printProgressBar(current, total)
+	}
+}
+
+func incrementProgress() {
+	atomic.AddInt64(&progressCurrent, 1)
+}
+
+func initProgressBar(total int) {
+	atomic.StoreInt64(&progressTotal, int64(total))
+	atomic.StoreInt64(&progressCurrent, 0)
+	progressEnabled = true
+	progressMu.Lock()
+	printProgressBar(0, int64(total))
+	progressMu.Unlock()
+}
+
+func finishProgressBar() {
+	progressMu.Lock()
+	clearLine()
+	progressEnabled = false
+	progressMu.Unlock()
+}
 
 const (
 	BANNER = `
@@ -43,35 +114,31 @@ const (
    Y88b  d88P Y88..88P 888   Y88b  888  888 Y88..88P Y88b.    888 "88b 
     "Y8888P88  "Y88P"  888    Y88b 888  888  "Y88P"   "Y8888P 888  888 
       
-	  v0.5                                              @waffl3ss`
+	  v0.8                                              @waffl3ss`
 
 	MITMPROXY_PORT     = 8000
 	CLIENT_VERSION     = "27/1.0.0.2021011237"
-	URL_TEAMS          = "https://teams.microsoft.com/api/mt/emea/beta/users/"
+	URL_TEAMS          = "https://teams.microsoft.com/api/mt/amer/beta/users/"
 	URL_PRESENCE_TEAMS = "https://presence.teams.microsoft.com/v1/presence/getpresence/"
 	TOKEN_FILE         = "token.txt"
-
-	TENANT_LOOKUP_BASE_URL = "https://tenantidlookup.com"
-	TENANT_LOOKUP_AUTH_URL = TENANT_LOOKUP_BASE_URL + "/api/v1/authenticate"
-	TENANT_LOOKUP_API_URL  = TENANT_LOOKUP_BASE_URL + "/api/v1/tenant-id"
 )
 
 type Config struct {
-	RunTeams     bool
-	RunOneDrive  bool
-	TeamsLegacy  bool
-	TeamsStatus  bool
-	InputFile    string
-	OutputFile   string
-	TargetDomain string
-	TeamsToken   string
-	MaxThreads   int
-	VerboseMode  bool
+	RunTeams       bool
+	RunOneDrive    bool
+	TeamsStatus    bool
+	InputFile      string
+	OutputFile     string
+	TargetDomain   string
+	TeamsToken     string
+	TenantName     string
+	ResolvedTenant string
+	MaxThreads     int
+	VerboseMode    bool
 }
 
 type Results struct {
 	ValidNames  []string
-	LegacyNames []string
 	StatusNames []string
 	mu          sync.Mutex
 }
@@ -100,19 +167,6 @@ type TokenResponse struct {
 	AccessToken string `json:"access_token"`
 }
 
-type TenantAuthRequest struct {
-	ClientID string `json:"client_id"`
-}
-
-type TenantAuthResponse struct {
-	Token       string `json:"token"`
-	AccessToken string `json:"accessToken"`
-}
-
-type TenantOpenIDConfig struct {
-	Issuer string `json:"issuer"`
-}
-
 type TenantLookupInfo struct {
 	TenantID          string `json:"tenantId"`
 	DefaultDomainName string `json:"defaultDomainName"`
@@ -128,17 +182,32 @@ func NewLogger(verbose bool) *Logger {
 }
 
 func (l *Logger) Info(format string, args ...interface{}) {
-	log.Printf("[INFO] "+format, args...)
+	msg := fmt.Sprintf("[INFO] "+format, args...)
+	if progressEnabled {
+		printWithProgressBar(msg)
+	} else {
+		log.Println(msg)
+	}
 }
 
 func (l *Logger) Debug(format string, args ...interface{}) {
 	if l.verbose {
-		log.Printf("[DEBUG] "+format, args...)
+		msg := fmt.Sprintf("[DEBUG] "+format, args...)
+		if progressEnabled {
+			printWithProgressBar(msg)
+		} else {
+			log.Println(msg)
+		}
 	}
 }
 
 func (l *Logger) Error(format string, args ...interface{}) {
-	log.Printf("[ERROR] "+format, args...)
+	msg := fmt.Sprintf("[ERROR] "+format, args...)
+	if progressEnabled {
+		printWithProgressBar(msg)
+	} else {
+		log.Println(msg)
+	}
 }
 
 type TeamsTokenAddon struct {
@@ -212,12 +281,12 @@ func parseFlags() *Config {
 
 	flag.BoolVar(&config.RunTeams, "teams", false, "Run the Teams User Enumeration Module")
 	flag.BoolVar(&config.RunOneDrive, "onedrive", false, "Run the One Drive Enumeration Module")
-	flag.BoolVar(&config.TeamsLegacy, "l", false, "Write legacy skype users to a separate file")
 	flag.BoolVar(&config.TeamsStatus, "s", false, "Write Teams Status for users to a separate file")
 	flag.StringVar(&config.InputFile, "i", "", "Input file with newline-separated users to check (required)")
 	flag.StringVar(&config.OutputFile, "o", "", "Write output to file")
 	flag.StringVar(&config.TargetDomain, "d", "", "Domain to target (required)")
 	flag.StringVar(&config.TeamsToken, "t", "", "Teams Token, either file, string, or 'proxy' for interactive Firefox")
+	flag.StringVar(&config.TenantName, "tenant", "", "Manually specify tenant name for OneDrive enumeration (e.g., 'contoso' for contoso.onmicrosoft.com)")
 	flag.IntVar(&config.MaxThreads, "threads", 10, "Number of threads to use in the Teams User Enumeration")
 	flag.BoolVar(&config.VerboseMode, "v", false, "Show verbose errors")
 	flag.Parse()
@@ -239,10 +308,6 @@ func validateConfig(config *Config) error {
 
 	if config.RunTeams && config.TeamsToken == "" {
 		return fmt.Errorf("Teams Bearer Token (-t) is required for Teams Enumeration")
-	}
-
-	if config.TeamsLegacy && config.OutputFile == "" {
-		return fmt.Errorf("Teams Legacy Output requires an output file (-o)")
 	}
 
 	if config.TeamsStatus && config.OutputFile == "" {
@@ -687,101 +752,132 @@ func getTokenViaProxy(logger *Logger) (string, error) {
 	}
 }
 
-func generateClientIDForTenantLookup() string {
-	bucket := strconv.FormatInt(time.Now().Unix()/15, 10)
-	hash := sha256.Sum256([]byte(bucket))
-	return fmt.Sprintf("%x", hash)
+func getTenantViaSelenium(domain string, logger *Logger) (*TenantLookupInfo, error) {
+	logger.Debug("Using headless browser to bypass reCAPTCHA...")
+
+	firefoxPath := findFirefox(logger)
+	if firefoxPath == "" {
+		return nil, fmt.Errorf("firefox not found - required for tenant lookup")
+	}
+
+	driverPath, err := setupGeckoDriver(logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to setup geckodriver: %w", err)
+	}
+
+	port := 9516
+	opts := []selenium.ServiceOption{
+		selenium.Output(io.Discard),
+	}
+
+	service, err := selenium.NewGeckoDriverService(driverPath, port, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start geckodriver: %w", err)
+	}
+	defer service.Stop()
+
+	time.Sleep(2 * time.Second)
+
+	firefoxCaps := firefox.Capabilities{
+		Binary: firefoxPath,
+		Args: []string{
+			"--headless",
+			"--new-instance",
+			"--no-remote",
+		},
+	}
+
+	caps := selenium.Capabilities{
+		"moz:firefoxOptions":  firefoxCaps,
+		"acceptInsecureCerts": true,
+	}
+
+	driver, err := selenium.NewRemote(caps, fmt.Sprintf("http://localhost:%d", port))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create webdriver: %w", err)
+	}
+	defer driver.Quit()
+
+	logger.Debug("Navigating to tenantidlookup.com...")
+	if err := driver.Get("https://tenantidlookup.com"); err != nil {
+		return nil, fmt.Errorf("failed to navigate to homepage: %w", err)
+	}
+
+	time.Sleep(3 * time.Second)
+
+	logger.Debug("Looking for search input...")
+	searchInput, err := driver.FindElement(selenium.ByCSSSelector, "input[type='text'], input[type='search'], input[name='domain'], input#domain, input.search-input")
+	if err != nil {
+		searchInput, err = driver.FindElement(selenium.ByXPATH, "//input[contains(@placeholder,'domain') or contains(@placeholder,'Domain') or contains(@placeholder,'search')]")
+		if err != nil {
+			searchInput, err = driver.FindElement(selenium.ByCSSSelector, "input")
+			if err != nil {
+				return nil, fmt.Errorf("could not find search input: %w", err)
+			}
+		}
+	}
+
+	logger.Debug("Entering domain: %s", domain)
+	if err := searchInput.Clear(); err != nil {
+		logger.Debug("Could not clear input: %v", err)
+	}
+	if err := searchInput.SendKeys(domain + selenium.EnterKey); err != nil {
+		return nil, fmt.Errorf("failed to enter domain and submit: %w", err)
+	}
+	logger.Debug("Waiting for results to load (reCAPTCHA execution)...")
+	time.Sleep(8 * time.Second)
+
+	pageSource, err := driver.PageSource()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get page source: %w", err)
+	}
+
+	onmicrosoftRe := regexp.MustCompile(`([a-zA-Z0-9_-]+)\.onmicrosoft\.com`)
+	matches := onmicrosoftRe.FindAllStringSubmatch(pageSource, -1)
+	if len(matches) > 0 {
+		for _, match := range matches {
+			if len(match) >= 2 {
+				tenantDomain := match[0]
+				logger.Debug("Found tenant domain: %s", tenantDomain)
+				return &TenantLookupInfo{
+					DefaultDomainName: tenantDomain,
+				}, nil
+			}
+		}
+	}
+
+	defaultDomainRe := regexp.MustCompile(`"defaultDomainName"\s*:\s*"([^"]+)"`)
+	domainMatch := defaultDomainRe.FindStringSubmatch(pageSource)
+	if len(domainMatch) >= 2 {
+		logger.Debug("Found defaultDomainName: %s", domainMatch[1])
+		return &TenantLookupInfo{
+			DefaultDomainName: domainMatch[1],
+		}, nil
+	}
+
+	logger.Debug("Results not found yet, waiting longer...")
+	time.Sleep(5 * time.Second)
+
+	pageSource, _ = driver.PageSource()
+	matches = onmicrosoftRe.FindAllStringSubmatch(pageSource, -1)
+	if len(matches) > 0 {
+		for _, match := range matches {
+			if len(match) >= 2 {
+				tenantDomain := match[0]
+				logger.Debug("Found tenant domain on retry: %s", tenantDomain)
+				return &TenantLookupInfo{
+					DefaultDomainName: tenantDomain,
+				}, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("could not find .onmicrosoft.com tenant info on page")
 }
 
-func getTokenFromTenantLookup() (string, error) {
-	clientID := generateClientIDForTenantLookup()
-	authReq := TenantAuthRequest{ClientID: clientID}
-
-	jsonData, err := json.Marshal(authReq)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal auth request: %w", err)
-	}
-
-	resp, err := http.Post(TENANT_LOOKUP_AUTH_URL, "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return "", fmt.Errorf("failed to authenticate: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("authentication failed with status: %d", resp.StatusCode)
-	}
-
-	var authResp TenantAuthResponse
-	if err := json.NewDecoder(resp.Body).Decode(&authResp); err != nil {
-		return "", fmt.Errorf("failed to decode auth response: %w", err)
-	}
-
-	token := authResp.Token
-	if token == "" {
-		token = authResp.AccessToken
-	}
-
-	if token == "" {
-		return "", fmt.Errorf("could not retrieve bearer token from authenticate response")
-	}
-
-	return token, nil
-}
-
-func getTenantInfoFromAPI(domain, token string) (*TenantLookupInfo, error) {
-	openIDURL := fmt.Sprintf("https://login.microsoftonline.com/%s/.well-known/openid-configuration", domain)
-	resp, err := http.Get(openIDURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get openid configuration: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to get openid configuration, status: %d", resp.StatusCode)
-	}
-
-	var config TenantOpenIDConfig
-	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
-		return nil, fmt.Errorf("failed to decode openid configuration: %w", err)
-	}
-
-	parts := strings.Split(config.Issuer, "/")
-	if len(parts) < 2 {
-		return nil, fmt.Errorf("could not extract tenant ID from openid configuration")
-	}
-	tenantID := parts[len(parts)-2]
-
-	if tenantID == "" {
-		return nil, fmt.Errorf("could not extract tenant ID from openid configuration")
-	}
-
-	tenantURL := fmt.Sprintf("%s/%s", TENANT_LOOKUP_API_URL, tenantID)
-	req, err := http.NewRequest("GET", tenantURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create tenant request: %w", err)
-	}
-
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-
-	client := &http.Client{}
-	resp, err = client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tenant info: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to get tenant info, status: %d, body: %s", resp.StatusCode, string(body))
-	}
-
-	var tenantInfo TenantLookupInfo
-	if err := json.NewDecoder(resp.Body).Decode(&tenantInfo); err != nil {
-		return nil, fmt.Errorf("failed to decode tenant info: %w", err)
-	}
-
-	return &tenantInfo, nil
+func getTenantFromLookupSite(domain string, logger *Logger) (*TenantLookupInfo, error) {
+	// because reCAPTCHA v3 requires real browser behavior for server-side verification
+	return getTenantViaSelenium(domain, logger)
 }
 
 func readInputFile(filename string, logger *Logger) ([]string, error) {
@@ -822,94 +918,28 @@ func readInputFile(filename string, logger *Logger) ([]string, error) {
 }
 
 func getTenantName(targetDomain string, logger *Logger) (string, error) {
-	logger.Debug("Tenant Discovery Method 1: DefaultDomainName via tenantidlookup.com...")
+	logger.Debug("Getting tenant info from tenantidlookup.com...")
 
-	token, err := getTokenFromTenantLookup()
-	if err == nil {
-		tenantInfo, err := getTenantInfoFromAPI(targetDomain, token)
-		if err == nil && tenantInfo.DefaultDomainName != "" {
-			defaultDomainName := tenantInfo.DefaultDomainName
-			if strings.HasSuffix(defaultDomainName, ".onmicrosoft.com") {
-				tenant := strings.TrimSuffix(defaultDomainName, ".onmicrosoft.com")
-				logger.Debug("SUCCESS: Found tenant name via DefaultDomainName: %s", tenant)
-				logger.Info("Using Tenant ID: %s", tenant)
-				return tenant, nil
-			}
-		}
-		logger.Debug("DefaultDomainName method failed: %v", err)
-	} else {
-		logger.Debug("Token retrieval failed: %v", err)
+	tenantInfo, err := getTenantFromLookupSite(targetDomain, logger)
+	if err != nil {
+		return "", fmt.Errorf("failed to get tenant info: %v", err)
 	}
 
-	logger.Debug("Tenant Discovery Method 2 (Backup): Sharepoint Discovery...")
-
-	domainPart := strings.Split(targetDomain, ".")[0]
-	sharepointURL := fmt.Sprintf("https://%s-my.sharepoint.com", domainPart)
-
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-		Timeout: 10 * time.Second,
+	if tenantInfo.DefaultDomainName == "" {
+		return "", fmt.Errorf("tenantidlookup.com returned empty DefaultDomainName")
 	}
 
-	resp, err := client.Get(sharepointURL)
-	if err == nil && resp.StatusCode == 302 {
-		location := resp.Header.Get("Location")
-		logger.Debug("Sharepoint redirect: %s", location)
-
-		re := regexp.MustCompile(`https://([^-]+)-my\.sharepoint\.com`)
-		matches := re.FindStringSubmatch(location)
-		if len(matches) > 1 {
-			tenant := matches[1]
-			logger.Debug("SUCCESS: Found tenant name via SharePoint: %s", tenant)
-			return tenant, nil
-		}
+	defaultDomainName := tenantInfo.DefaultDomainName
+	if strings.HasSuffix(defaultDomainName, ".onmicrosoft.com") {
+		tenant := strings.TrimSuffix(defaultDomainName, ".onmicrosoft.com")
+		logger.Info("Using Tenant: %s", tenant)
+		return tenant, nil
 	}
 
-	logger.Debug("Tenant Discovery Method 3 (Backup): Pattern Proving...")
-
-	domainBase := strings.Split(targetDomain, ".")[0]
-	patterns := []string{
-		domainBase,
-		strings.ReplaceAll(domainBase, "-", ""),
-		strings.ReplaceAll(strings.ReplaceAll(targetDomain, ".com", ""), ".", ""),
-		strings.ReplaceAll(targetDomain, ".", ""),
-		domainBase + "region",
-		"regionof" + domainBase,
-		domainBase + "gov",
-		domainBase + "-region",
-		domainBase + "city",
-		domainBase + "county",
-	}
-
-	for i, pattern := range patterns {
-		logger.Debug("Testing Pattern %d: %s", i+1, pattern)
-		testURL := fmt.Sprintf("https://%s-my.sharepoint.com", pattern)
-
-		resp, err := client.Get(testURL)
-		if err == nil && resp != nil && (resp.StatusCode == 302 || resp.StatusCode == 200 || resp.StatusCode == 401 || resp.StatusCode == 403) {
-			logger.Debug("SUCCESS: Found working tenant pattern: %s (HTTP %d)", pattern, resp.StatusCode)
-			return pattern, nil
-		}
-		if err != nil {
-			logger.Debug("FAIL: Pattern %s returned error: %v", pattern, err)
-		} else if resp != nil {
-			logger.Debug("FAIL: Pattern %s returned with HTTP %d", pattern, resp.StatusCode)
-		} else {
-			logger.Debug("FAIL: Pattern %s returned nil response", pattern)
-		}
-	}
-
-	fallback := strings.Split(targetDomain, ".")[0]
-	logger.Debug("FALLBACK: Using domain-based tenant name: %s", fallback)
-	return fallback, nil
+	return "", fmt.Errorf("DefaultDomainName '%s' does not end with .onmicrosoft.com", defaultDomainName)
 }
 
-func oneDriveEnumeratorWithCounter(targetTenant, username, targetDomain string, results *Results, logger *Logger, count, total int) {
+func oneDriveEnumerator(targetTenant, username, targetDomain string, results *Results, logger *Logger) {
 	usernamePart := strings.ReplaceAll(username, ".", "_")
 	domainPart := strings.ReplaceAll(targetDomain, ".", "_")
 	testURL := fmt.Sprintf("https://%s-my.sharepoint.com/personal/%s_%s/_layouts/15/onedrive.aspx", targetTenant, usernamePart, domainPart)
@@ -931,13 +961,13 @@ func oneDriveEnumeratorWithCounter(targetTenant, username, targetDomain string, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 200 || resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 302 {
-		logger.Info("[%3d/%d] [+] %s@%s", count, total, username, targetDomain)
+		logger.Info("[+] %s@%s", username, targetDomain)
 
 		results.mu.Lock()
 		results.ValidNames = append(results.ValidNames, username)
 		results.mu.Unlock()
 	} else {
-		logger.Debug("[%3d/%d] [-] %s@%s (HTTP %d)", count, total, username, targetDomain, resp.StatusCode)
+		logger.Debug("[-] %s@%s (HTTP %d)", username, targetDomain, resp.StatusCode)
 	}
 }
 
@@ -1004,7 +1034,7 @@ func getPresence(mri, bearerToken string, logger *Logger) (string, string, strin
 	return presence.Availability, presence.DeviceType, presence.CalendarData.OutOfOfficeNote.Message
 }
 
-func teamsEnumeratorWithCounter(bearerToken, username, targetDomain string, config *Config, results *Results, logger *Logger, count, total int) {
+func teamsEnumerator(bearerToken, username, targetDomain string, config *Config, results *Results, logger *Logger) {
 	potentialUser := fmt.Sprintf("%s@%s", username, targetDomain)
 	logger.Debug("Testing User %s", potentialUser)
 
@@ -1036,12 +1066,12 @@ func teamsEnumeratorWithCounter(bearerToken, username, targetDomain string, conf
 
 	switch resp.StatusCode {
 	case 403:
-		logger.Info("[%3d/%d] [+] %s", count, total, potentialUser)
+		logger.Info("[+] %s", potentialUser)
 		results.mu.Lock()
 		results.ValidNames = append(results.ValidNames, username)
 		results.mu.Unlock()
 	case 404:
-		logger.Debug("[%3d/%d] [-] %s ", count, total, potentialUser)
+		logger.Debug("[-] %s", potentialUser)
 	case 200:
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
@@ -1058,31 +1088,6 @@ func teamsEnumeratorWithCounter(bearerToken, username, targetDomain string, conf
 		if len(teamsResp) > 0 {
 			userInfo := teamsResp[0]
 
-			if _, hasSkypeID := userInfo["skypeId"]; hasSkypeID {
-				logger.Info("[%3d/%d] [+] %s -- Legacy Skype Detected", count, total, potentialUser)
-				results.mu.Lock()
-				results.ValidNames = append(results.ValidNames, username)
-				results.LegacyNames = append(results.LegacyNames, username)
-				results.mu.Unlock()
-
-				if config.VerboseMode {
-					jsonOutput, _ := json.MarshalIndent(userInfo, "", "  ")
-					logger.Debug(string(jsonOutput))
-				}
-			} else {
-				if !config.TeamsStatus {
-					logger.Info("[%3d/%d] [+] %s", count, total, potentialUser)
-					results.mu.Lock()
-					results.ValidNames = append(results.ValidNames, username)
-					results.mu.Unlock()
-
-					if config.VerboseMode {
-						jsonOutput, _ := json.MarshalIndent(userInfo, "", "  ")
-						logger.Debug(string(jsonOutput))
-					}
-				}
-			}
-
 			if config.TeamsStatus {
 				if mri, exists := userInfo["mri"].(string); exists {
 					availability, deviceType, outOfOfficeNote := getPresence(mri, bearerToken, logger)
@@ -1090,10 +1095,10 @@ func teamsEnumeratorWithCounter(bearerToken, username, targetDomain string, conf
 					if outOfOfficeNote != "" {
 						cleanedNote := strings.ReplaceAll(outOfOfficeNote, "\n", "--")
 						cleanedNote = strings.ReplaceAll(cleanedNote, "\r", "--")
-						logger.Info("[%3d/%d] [+] %s -- %s -- %s -- %s", count, total, potentialUser, availability, deviceType, cleanedNote)
+						logger.Info("[+] %s -- %s -- %s -- %s", potentialUser, availability, deviceType, cleanedNote)
 						statusEntry += " -- " + cleanedNote
 					} else {
-						logger.Info("[%3d/%d] [+] %s -- %s -- %s", count, total, potentialUser, availability, deviceType)
+						logger.Info("[+] %s -- %s -- %s", potentialUser, availability, deviceType)
 					}
 
 					results.mu.Lock()
@@ -1101,9 +1106,19 @@ func teamsEnumeratorWithCounter(bearerToken, username, targetDomain string, conf
 					results.StatusNames = append(results.StatusNames, statusEntry)
 					results.mu.Unlock()
 				}
+			} else {
+				logger.Info("[+] %s", potentialUser)
+				results.mu.Lock()
+				results.ValidNames = append(results.ValidNames, username)
+				results.mu.Unlock()
+
+				if config.VerboseMode {
+					jsonOutput, _ := json.MarshalIndent(userInfo, "", "  ")
+					logger.Debug(string(jsonOutput))
+				}
 			}
 		} else {
-			logger.Debug("[%3d/%d] [-] %s", count, total, potentialUser)
+			logger.Debug("[-] %s", potentialUser)
 		}
 	case 401:
 		logger.Error("Error with Teams Auth Token... Please check your token or proxy settings")
@@ -1177,7 +1192,7 @@ func writeResults(config *Config, results *Results, logger *Logger) error {
 
 	if config.OutputFile != "" {
 		if _, err := os.Stat(config.OutputFile); err == nil {
-			fmt.Print(" [!] Output file exists, overwrite? (Y/n) ")
+			fmt.Printf(" [!] Output file '%s' exists, overwrite? (Y/n): ", config.OutputFile)
 			var response string
 			fmt.Scanln(&response)
 			response = strings.ToLower(strings.TrimSpace(response))
@@ -1202,52 +1217,11 @@ func writeResults(config *Config, results *Results, logger *Logger) error {
 		logger.Info("Wrote %d valid users to %s", len(uniqueNames), config.OutputFile)
 	}
 
-	if config.TeamsLegacy && len(results.LegacyNames) > 0 {
-		legacyFile := "Legacy_" + config.OutputFile
-
-		if _, err := os.Stat(legacyFile); err == nil {
-			fmt.Print(" [!] Legacy output file exists, overwrite? (Y/n) ")
-			var response string
-			fmt.Scanln(&response)
-			response = strings.ToLower(strings.TrimSpace(response))
-
-			if response != "" && response != "y" && response != "yes" {
-				logger.Info("Not overwriting legacy skype users file")
-			} else {
-				uniqueLegacy := removeDuplicates(results.LegacyNames)
-				file, err := os.Create(legacyFile)
-				if err != nil {
-					return fmt.Errorf("Failed to create legacy output file: %v", err)
-				}
-				defer file.Close()
-
-				for _, name := range uniqueLegacy {
-					fmt.Fprintf(file, "%s@%s\n", name, config.TargetDomain)
-				}
-
-				logger.Info("Wrote %d legacy skype users to %s", len(uniqueLegacy), legacyFile)
-			}
-		} else {
-			uniqueLegacy := removeDuplicates(results.LegacyNames)
-			file, err := os.Create(legacyFile)
-			if err != nil {
-				return fmt.Errorf("Failed to create legacy output file: %v", err)
-			}
-			defer file.Close()
-
-			for _, name := range uniqueLegacy {
-				fmt.Fprintf(file, "%s@%s\n", name, config.TargetDomain)
-			}
-
-			logger.Info("Wrote %d legacy skype users to %s", len(uniqueLegacy), legacyFile)
-		}
-	}
-
 	if config.TeamsStatus && len(results.StatusNames) > 0 {
 		statusFile := "Status_" + config.OutputFile
 
 		if _, err := os.Stat(statusFile); err == nil {
-			fmt.Print(" [!] Status output file exists, overwrite? (Y/n) ")
+			fmt.Printf(" [!] Status output file '%s' exists, overwrite? (Y/n): ", statusFile)
 			var response string
 			fmt.Scanln(&response)
 			response = strings.ToLower(strings.TrimSpace(response))
@@ -1286,8 +1260,6 @@ func writeResults(config *Config, results *Results, logger *Logger) error {
 
 			logger.Info("Wrote %d users with status information to %s", len(uniqueStatus), statusFile)
 		}
-	} else if config.TeamsLegacy && len(results.LegacyNames) == 0 {
-		logger.Info("No legacy skype users found")
 	}
 
 	return nil
@@ -1296,41 +1268,55 @@ func writeResults(config *Config, results *Results, logger *Logger) error {
 func runOneDriveEnumeration(config *Config, usernames []string, results *Results, logger *Logger) error {
 	logger.Info("Running OneDrive Enumeration...")
 
-	logger.Debug("Discovering tenant for target domain")
-	targetTenant, err := getTenantName(config.TargetDomain, logger)
-	if err != nil || targetTenant == "" {
-		return fmt.Errorf("Error retrieving tenant for target: %v", err)
+	if config.ResolvedTenant == "" {
+		return fmt.Errorf("no tenant resolved for OneDrive enumeration")
 	}
 
-	logger.Debug("Using target tenant %s", targetTenant)
+	logger.Debug("Using target tenant %s", config.ResolvedTenant)
 	logger.Debug("Running OneDrive Enumeration using %d threads", config.MaxThreads)
 
 	semaphore := make(chan struct{}, config.MaxThreads)
 	var wg sync.WaitGroup
 
 	total := len(usernames)
-	completed := 0
-	var completedMutex sync.Mutex
+
+	initProgressBar(total)
 
 	for _, username := range usernames {
+		if cancelled.Load() {
+			break
+		}
 		wg.Add(1)
 		go func(user string) {
 			defer wg.Done()
 
+			if cancelled.Load() {
+				return
+			}
+
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			completedMutex.Lock()
-			completed++
-			currentCount := completed
-			completedMutex.Unlock()
+			if cancelled.Load() {
+				return
+			}
 
-			oneDriveEnumeratorWithCounter(targetTenant, user, config.TargetDomain, results, logger, currentCount, total)
+			oneDriveEnumerator(config.ResolvedTenant, user, config.TargetDomain, results, logger)
+
+			incrementProgress()
+			progressMu.Lock()
+			current := atomic.LoadInt64(&progressCurrent)
+			printProgressBar(current, int64(total))
+			progressMu.Unlock()
 		}(username)
 	}
 
 	wg.Wait()
-	logger.Info("OneDrive enumeration completed")
+	finishProgressBar()
+	fmt.Println()
+	if !cancelled.Load() {
+		logger.Info("OneDrive enumeration completed")
+	}
 	return nil
 }
 
@@ -1353,30 +1339,48 @@ func runTeamsEnumeration(config *Config, usernames []string, results *Results, l
 	var wg sync.WaitGroup
 
 	total := len(usernames)
-	completed := 0
-	var completedMutex sync.Mutex
+
+	initProgressBar(total)
 
 	for _, username := range usernames {
+		if cancelled.Load() {
+			break
+		}
 		wg.Add(1)
 		go func(user string) {
 			defer wg.Done()
 
+			if cancelled.Load() {
+				return
+			}
+
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			completedMutex.Lock()
-			completed++
-			currentCount := completed
-			completedMutex.Unlock()
+			if cancelled.Load() {
+				return
+			}
 
-			teamsEnumeratorWithCounter(token, user, config.TargetDomain, config, results, logger, currentCount, total)
+			teamsEnumerator(token, user, config.TargetDomain, config, results, logger)
+
+			incrementProgress()
+			progressMu.Lock()
+			current := atomic.LoadInt64(&progressCurrent)
+			printProgressBar(current, int64(total))
+			progressMu.Unlock()
 		}(username)
 	}
 
 	wg.Wait()
-	logger.Info("Teams Enumeration Completed")
+	finishProgressBar()
+	fmt.Println()
+	if !cancelled.Load() {
+		logger.Info("Teams Enumeration Completed")
+	}
 	return nil
 }
+
+var cancelChan = make(chan struct{}, 1)
 
 func setupSignalHandler() {
 	c := make(chan os.Signal, 1)
@@ -1384,15 +1388,56 @@ func setupSignalHandler() {
 
 	go func() {
 		<-c
-		fmt.Println("\n[!] Received interrupt signal, cleaning up...")
-		os.Exit(0)
+		cancelled.Store(true)
+		select {
+		case cancelChan <- struct{}{}:
+		default:
+		}
 	}()
+}
+
+func handleCancellation(config *Config, results *Results, logger *Logger) {
+	time.Sleep(500 * time.Millisecond)
+
+	progressMu.Lock()
+	clearLine()
+	progressEnabled = false
+	progressMu.Unlock()
+
+	fmt.Println("\n[!] Cancelled by user!")
+	fmt.Println()
+
+	validCount := len(results.ValidNames)
+	if validCount > 0 {
+		fmt.Printf("[?] Found %d valid users so far. Save results? (Y/n): ", validCount)
+
+		var response string
+		tty, err := os.Open("/dev/tty")
+		if err == nil {
+			reader := bufio.NewReader(tty)
+			response, _ = reader.ReadString('\n')
+			tty.Close()
+		} else {
+			reader := bufio.NewReader(os.Stdin)
+			response, _ = reader.ReadString('\n')
+		}
+		response = strings.ToLower(strings.TrimSpace(response))
+
+		if response == "" || response == "y" || response == "yes" {
+			if err := writeResults(config, results, logger); err != nil {
+				fmt.Printf("[!] Error saving results: %v\n", err)
+			}
+		} else {
+			fmt.Println("[!] Results not saved.")
+		}
+	} else {
+		fmt.Println("[!] No valid users found yet.")
+	}
 }
 
 func main() {
 	fmt.Println(BANNER)
 	fmt.Println()
-	setupSignalHandler()
 	config := parseFlags()
 	logger := NewLogger(config.VerboseMode)
 
@@ -1412,8 +1457,38 @@ func main() {
 
 	results := &Results{
 		ValidNames:  make([]string, 0),
-		LegacyNames: make([]string, 0),
 		StatusNames: make([]string, 0),
+	}
+
+	setupSignalHandler()
+
+	if config.RunOneDrive {
+		if config.TenantName != "" {
+			config.ResolvedTenant = config.TenantName
+			logger.Info("Using provided tenant: %s", config.ResolvedTenant)
+		} else {
+			logger.Info("Resolving tenant for OneDrive enumeration...")
+			tenant, err := getTenantName(config.TargetDomain, logger)
+			if err != nil || tenant == "" {
+				logger.Error("Failed to resolve tenant: %v", err)
+				if config.RunTeams {
+					fmt.Print("[?] Continue with Teams enumeration only? (Y/n): ")
+					var response string
+					fmt.Scanln(&response)
+					response = strings.ToLower(strings.TrimSpace(response))
+					if response != "" && response != "y" && response != "yes" {
+						logger.Info("Exiting.")
+						os.Exit(1)
+					}
+					config.RunOneDrive = false
+				} else {
+					logger.Error("Use -tenant flag to specify manually")
+					os.Exit(1)
+				}
+			} else {
+				config.ResolvedTenant = tenant
+			}
+		}
 	}
 
 	if config.RunTeams && len(usernames) > 0 {
@@ -1440,11 +1515,15 @@ func main() {
 
 	}
 
-	if config.RunOneDrive {
+	if config.RunOneDrive && !cancelled.Load() {
 		if err := runOneDriveEnumeration(config, usernames, results, logger); err != nil {
 			logger.Error("OneDrive Enumeration Failed: %v", err)
-			os.Exit(1)
 		}
+	}
+
+	if cancelled.Load() {
+		handleCancellation(config, results, logger)
+		os.Exit(0)
 	}
 
 	if err := writeResults(config, results, logger); err != nil {
@@ -1454,9 +1533,6 @@ func main() {
 
 	logger.Info("Enumeration completed successfully!")
 	logger.Info("Total valid users found: %d", len(removeDuplicates(results.ValidNames)))
-	if len(results.LegacyNames) > 0 {
-		logger.Info("Legacy Skype users found: %d", len(removeDuplicates(results.LegacyNames)))
-	}
 	if len(results.StatusNames) > 0 {
 		logger.Info("Users with status information: %d", len(removeDuplicates(results.StatusNames)))
 	}
@@ -1467,4 +1543,3 @@ func main() {
 		}
 	}
 }
-

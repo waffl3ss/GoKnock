@@ -3,13 +3,11 @@
 #### Please make sure to actually utilize the README. 
 
 Designed to validate potential usernames by querying OneDrive and/or Microsoft Teams, which are passive methods.  
-It can output/create a list of legacy Skype users identified through Microsoft Teams enumeration.
 It can also get details from Teams, such as availability, device type, and out of office message.
 Finally, it also creates a nice clean list for future usage, all conducted from a single tool. 
 
 If youre having problems with the token, you didnt go through the README, or you didnt use the interactive firefox option.
 
-Compiled releases found in the [RELEASES](https://github.com/waffl3ss/GoKnock/releases) page.
 
 If building from source:
 ```
@@ -17,6 +15,14 @@ go mod init GoKnock
 go mod tidy
 go build
 ```
+
+### v0.8 QoL and Fixes
+- Teams enumeration was having some issues, that is now fixed. 
+- OneDrive enumeration broke again, but now using a headless browser to get the tenant name, or you can provide the tenant name manually by going to https://tenantidlookup.com and getting the first value of the .onmicrosoft.com line
+- Progress bar implemented and working.
+- Removed the Legacy Skype option, as its no longer useful.
+- General QoL improvements to ensure valid functionality.
+- Im no longer providing the binaries... if you cant build it, dont use it.
 
 ### v0.5 Tenant Lookup Fixes
 - Implemented a new way to find the tenant name. Should be much better at actually getting the tenant name now.
@@ -37,7 +43,6 @@ go build
 - The tool does not require an output file as an option, and if not supplied, it will print to screen only.  
 - Verbose mode outputs a lot of data, but even more so when using the proxy. You have been warned.
 - The Teams option requires a bearer token. The script automatically parses the token to get whats needed for authentication. (highly recommend the `-t proxy` option to get the token)  
-- The LEGACY (-l) option shows users that still have SkypeID settings and will write it to a seperate file (Output option (-o) required).
 - The STATUS (-s) option shows user teams availability, device, and OutOfOffice message, then writes it to a seperate file (Output option (-o) required). (Old teams token dosnt work for this. Documentation on getting the new token is at the bottom of the README)
 
 ------------------------------------------------------------------------------------
@@ -54,13 +59,12 @@ go build
    Y88b  d88P Y88..88P 888   Y88b  888  888 Y88..88P Y88b.    888 "88b 
     "Y8888P88  "Y88P"  888    Y88b 888  888  "Y88P"   "Y8888P 888  888 
       
-          v0.5                                              @waffl3ss
+          v0.8                                              @waffl3ss
 
   -d string
         Domain to target (required)
   -i string
         Input file with newline-separated users to check (required)
-  -l    Write legacy skype users to a separate file
   -o string
         Write output to file
   -onedrive
@@ -70,6 +74,8 @@ go build
         Teams Token, either file, string, or 'proxy' for interactive Firefox
   -teams
         Run the Teams User Enumeration Module
+  -tenant string
+    	Manually specify tenant name for OneDrive enumeration (e.g., 'contoso' for contoso.onmicrosoft.com)
   -threads int
         Number of threads to use in the Teams User Enumeration (default 10)
   -v    Show verbose errors
@@ -80,7 +86,9 @@ go build
 ./goknock -teams -i UsersList.txt -d Example.com -o OutFile.txt -t BearerToken.txt
 ./goknock -teams -i UserList.txt -d Example.com -o OutFile.txt -t proxy
 ./goknock -onedrive -i UsersList.txt -d Example.com -o OutFile.txt
-./goknock -onedrive -teams -i UsersList.txt -d Example.com -t BearerToken.txt -l
+./goknock -onedrive -teams -i UsersList.txt -d Example.com -t BearerToken.txt 
+./goknock -onedrive -teams -i UsersList.txt -d Example.com -t BearerToken.txt -tenant contoso
+
 ```
 
 ------------------------------------------------------------------------------------
